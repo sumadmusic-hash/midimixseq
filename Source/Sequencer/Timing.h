@@ -5,8 +5,15 @@
 // WICHTIG: Diese Datei ist KEIN Produktcode für Sampler/GUI/MIDImix, sondern die
 // isolierte, hardwarefreie Mathematik des Sequencers. Sie enthält keine erfundenen
 // Defaults: bpm <= 0 oder fehlende Position liefern "kein Ereignis".
+//
+// Echtzeit-Hinweis (Audit): Alle Funktionen sind frei von Heap-Allokation, Sperr-
+// operationen und Schleifen mit variabler, ungebundener Laufzeit (der Step-Scan ist
+// gedeckelt). Der Aufrufer muss Blockpositionen aus einem einzigen Host-Query füllen;
+// Start-PPQ und Sampleanzahl dürfen nicht aus unterschiedlichen Quellen vermischt
+// werden, da andernfalls Inkonsistenzen innerhalb eines Blocks möglich sind.
 #pragma once
 
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <optional>
@@ -50,12 +57,32 @@ inline double samplesPerPPQ(double bpm, double sampleRate)
 }
 
 // sampleOffset = round((eventPPQ - blockStartPPQ) * 60 * sampleRate / bpm)
-// Begrenzt auf [0, numSamples-1]. Rückgabe leeres Optional, wenn das Ereignis nicht
-// innerhalb des halboffenen Blocks [blockStartPPQ, blockEndPPQ) liegt oder Daten fehlen.
+// Begrenzt auf [0, numSamples-1] (Plan 5.3 / Regel R21). Rückgabe leeres Optional, wenn
+// das Ereignis nicht innerhalb des halboffenen Blocks [blockStartPPQ, blockEndPPQ) liegt
+// oder Daten fehlen.
+//
+// Randfall-Korrekturen (Audit 2026-10-31):
+//  1. Kein Stillschweigen bei fehlenden Host-Daten: numSamples <= 0 ist ein
+//     Konfigurationsfehler und wird per assert markiert (Release: "kein Trigger").
+//     Die übrigen Invaliditätsgründe (bpm/sampleRate <= 0, nicht endliches startPPQ)
+//     sind legitime "Host liefert keine Sync-Daten"-Fälle im Sinne von Regel R7 und
+//     lösen kein assert aus.
+//  2. Nach-Kanten-Rounding: Ein Ereignis innerhalb [start,end), dessen Rundung hinter das
+//     letzte Sample fällt, würde beim Clamping auf numSamples-1 einen Doppeltrigger am
+//     Blockende erzeugen; es wird dem nächsten Block überlassen. Der Fall tritt nur bei
+//     Blöcken kleiner als ca. 1 Sample pro Schrittweite auf und ist asserted.
+//  3. Vor-Kanten-Rounding (neu): Symmetrisch dazu darf ein Ereignis, das formal erst im
+//     NACHSTEN Block liegt (eventPPQ >= endPPQ), durch Rundung nicht auf den letzten
+//     Sample-Offset DIESES Blocks fallen – das wäre exakt derselbe Doppeltrigger. Solche
+//     Ereignisse werden abgewiesen; der nächste Block triggert sie an Offset 0 bzw. früh.
 inline std::optional<int> sampleOffsetForEventPPQ(const BlockPosition& p, double eventPPQ)
 {
     if (!isValid(p))
+    {
+        assert(!(p.bpm > 0.0 && p.sampleRate > 0.0 && std::isfinite(p.startPPQ) && p.numSamples <= 0)
+               && "Audio-Block ohne Samples (Regel R7/R12)");
         return std::nullopt;
+    }
 
     const double endPPQ = computeBlockEndPPQ(p);
     // halboffenes Intervall: Start inclusive, Ende exclusive -> keine Doppeltrigger
@@ -64,11 +91,14 @@ inline std::optional<int> sampleOffsetForEventPPQ(const BlockPosition& p, double
         return std::nullopt;
 
     const double sppq = samplesPerPPQ(p.bpm, p.sampleRate);
-    long long off = llround((eventPPQ - p.startPPQ) * sppq);
-    if (off < 0)
-        off = 0;
+    long long off = std::llround((eventPPQ - p.startPPQ) * sppq);
     if (off > static_cast<long long>(p.numSamples) - 1)
-        off = static_cast<long long>(p.numSamples) - 1;
+    {
+        assert(false && "Ereignis rundet hinter das Blockende -> nächster Block (Doppeltrigger-Schutz)");
+        return std::nullopt;
+    }
+    if (off < 0)
+        off = 0; // Rundung auf Blockanfang; gültig, da eventPPQ >= startPPQ
     return static_cast<int>(off);
 }
 
@@ -115,6 +145,12 @@ void collectStepOffsetsInBlock(const BlockPosition& p,
     long long i1 = static_cast<long long>(std::ceil((endPPQ - cycleStartPPQ) / kPpqPerStep));
     if (i0 < 0) i0 = 0;
     if (i1 < i0) i1 = i0;
+    // Kosten-Deckel gegen pathologische Eingaben (z. B. Host mit ppm-großer BPM oder
+    // defektem startPPQ): verhindert einen praktisch endlosen Loop im Audio-Thread.
+    // Steps, die nicht geprüft werden können, gehen verloren statt den Thread zu blockieren.
+    constexpr long long kMaxStepsPerBlockScan = 4096;
+    if (i1 - i0 > kMaxStepsPerBlockScan)
+        i1 = i0 + kMaxStepsPerBlockScan;
 
     for (long long i = i0; i <= i1; ++i)
     {
