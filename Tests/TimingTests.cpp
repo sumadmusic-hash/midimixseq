@@ -17,8 +17,7 @@ MDS_TEST(blockEndPPQ_formula)
 
 MDS_TEST(sampleOffset_clamped_and_valid)
 {
-    // Referenzfall mit ganzzahligen Werten: 120 BPM, 44100 Hz -> 1 PPQ = 17.7 samples,
-    // eine 16tel-Note (0.25 PPQ) = 4.425 samples.
+    // 120 BPM, 44100 Hz -> samplesPerPPQ = 60*44100/120 = 22050.
     BlockPosition p{ 0.0, 120.0, 512, 44100.0 };
     CHECK_NEAR(samplesPerPPQ(p.bpm, p.sampleRate), 60.0 * 44100.0 / 120.0, 1e-9); // 22050
 
@@ -26,11 +25,24 @@ MDS_TEST(sampleOffset_clamped_and_valid)
     CHECK(firstStep.has_value());
     CHECK_EQ(*firstStep, 0);                       // Blockbeginn ist immer einschließend
 
-    auto secondStep = sampleOffsetForEventPPQ(p, 0.25);
+    // Randfall-Klarstellung (Audit): blockEndPPQ(512 Samples @44.1k/120) = 0.0232199 PPQ.
+    // Ein Step bei 0.25 PPQ liegt AUSSERHALB dieses Blocks und triggert hier nicht;
+    // er gehört in einen späteren Block. In einem Block, der ihn enthält, gilt exakt:
+    // Offset = round(eventPPQ * samplesPerPPQ).
+    CHECK(!sampleOffsetForEventPPQ(p, 0.25).has_value());
+    // Referenzfall 48 kHz/120 BPM: 1 PPQ = 24000 Samples -> Step bei 0.25 PPQ = Offset 6000
+    // in einem Block von 8000 Samples (endPPQ = 1/3 PPQ > 0.25).
+    BlockPosition ref48{ 0.0, 120.0, 8000, 48000.0 };
+    auto r48 = sampleOffsetForEventPPQ(ref48, 0.25);
+    CHECK(r48.has_value());
+    CHECK_EQ(*r48, 6000);
+    // Referenzfall 44.1 kHz/120 BPM: round(0.25 * 22050) = 5512 in einem Block von 1.0 PPQ.
+    BlockPosition stepBlock{ 0.0, 120.0, 22050, 44100.0 };
+    auto secondStep = sampleOffsetForEventPPQ(stepBlock, 0.25);
     CHECK(secondStep.has_value());
-    CHECK_EQ(*secondStep, 4);                      // round(0.25 * 22050) = 4
+    CHECK_EQ(*secondStep, 5512);
 
-    // blockEndPPQ = 512 * 120 / (60 * 44100) = 0.0232199... -> Step bei 0.03 fällt hinaus
+    // Ereignisse jenseits des Blocks liefern kein Offset.
     CHECK(!sampleOffsetForEventPPQ(p, 0.03).has_value());
     CHECK(!sampleOffsetForEventPPQ(p, 10.0).has_value());
     CHECK(!sampleOffsetForEventPPQ(p, -0.01).has_value());
@@ -41,9 +53,13 @@ MDS_TEST(sampleOffset_clamped_and_valid)
     BlockPosition next{ endPPQ, 120.0, 512, 44100.0 };
     CHECK(sampleOffsetForEventPPQ(next, endPPQ).has_value());
 
-    // Der Offset wird nie außerhalb des Blocks erzeugt, auch bei sehr kleinen Blöcken.
-    BlockPosition tiny{ 0.0, 120.0, 3, 44100.0 };
-    for (double ppq : { 0.0, 0.0005, 0.001, 0.0012 })
+    // Regression (Audit-Fix): Ein Ereignis innerhalb [start,end), das durch Rundung hinter
+    // das letzte Sample fallen würde, wird NICHT mehr auf numSamples-1 geclampt (das wäre
+    // ein Doppeltrigger am Blockende), sondern dem nächsten Block überlassen.
+    BlockPosition tiny{ 0.0, 120.0, 3, 44100.0 };   // endPPQ = 3/22050 ≈ 0.000136
+    CHECK(!sampleOffsetForEventPPQ(tiny, 0.00013).has_value()); // rundet auf 3 -> nächster Block
+    // Gültige Offsets bleiben stets im Puffer [0, numSamples-1].
+    for (double ppq : { 0.0, 0.00005, 0.0001 })
     {
         if (auto c = sampleOffsetForEventPPQ(tiny, ppq))
             CHECK(c.value() >= 0 && c.value() < tiny.numSamples);
@@ -96,17 +112,43 @@ static RunResult runPattern(int blockSize, double swing, double durationSec = 8.
     RunResult r;
     const double blockPPQ = blockSize * bpm / (60.0 * sr);
     const double totalPPQ = durationSec * bpm / 60.0;
-    const long blocks = static_cast<long>(std::ceil(totalPPQ / blockPPQ));
-
-    for (long b = 0; b < blocks; ++b)
+    // Audit-Korrektur: vorher ceil() -> bei nicht teilender Blockgröße wurde ein
+    // Teilblock über das Analyseende hinaus gezählt (Randstep am Zyklusbeginn wurde
+    // doppelt erfasst). Jetzt: volle Blöcke + expliziter Restblock, dessen Ende exakt
+    // bei totalPPQ geklemmt wird. Die analysierte Gesamtdauer ist damit für alle
+    // Blockgrößen identisch.
+    const long fullBlocks = static_cast<long>(std::floor(totalPPQ / blockPPQ + 1e-9));
+    auto scanBlock = [&](double startPPQ, int samples)
     {
-        BlockPosition p{ b * blockPPQ, bpm, blockSize, sr };
+        BlockPosition p{ startPPQ, bpm, samples, sr };
         collectStepOffsetsInBlock(p, 0.0, swing, [&](int idx, int off, double)
         {
-            CHECK(off >= 0 && off < blockSize);
+            CHECK(off >= 0 && off < samples);
             r.hits[idx] += 1;
             r.total += 1;
         });
+    };
+    for (long b = 0; b < fullBlocks; ++b)
+        scanBlock(b * blockPPQ, blockSize);
+    const double covered = fullBlocks * blockPPQ;
+    if (totalPPQ - covered > 1e-12) // Reststück < ein voller Block
+    {
+        const int remSamples = static_cast<int>((totalPPQ - covered) * (60.0 * sr) / bpm + 0.5);
+        if (remSamples > 0)
+        {
+            // Der Restblock endet formal hinter totalPPQ; Steps jenseits von totalPPQ
+            // gehören in das nächste Analysefenster und werden hier herausgefiltert.
+            BlockPosition p{ covered, bpm, remSamples, sr };
+            collectStepOffsetsInBlock(p, 0.0, swing, [&](int idx, int off, double ppq)
+            {
+                CHECK(off >= 0 && off < remSamples);
+                if (ppq >= covered && ppq < totalPPQ)
+                {
+                    r.hits[idx] += 1;
+                    r.total += 1;
+                }
+            });
+        }
     }
     return r;
 }
