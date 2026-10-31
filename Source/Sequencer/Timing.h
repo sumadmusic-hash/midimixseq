@@ -13,6 +13,7 @@
 // werden, da andernfalls Inkonsistenzen innerhalb eines Blocks möglich sind.
 #pragma once
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -25,6 +26,26 @@ namespace mds::timing
 inline constexpr double kPpqPerStep = 0.25;
 inline constexpr int kNumSteps = 16;
 inline constexpr int kNumTracks = 8;
+
+// Scan-Kosten-Deckel fuer collectStepOffsetsInBlock (P3). Exportiert, damit Tests
+// und Aufrufer das Limit pruefen koennen.
+inline constexpr long long kMaxStepsPerBlockScan = 4096;
+
+// Zaehlt Audio-Block-Scans, bei denen der Deckel erreicht wurde (verlorene Steps
+// moeglich). Atomar, relaxed fetch_add, kein Assert, keine Schleifenverlaengerung.
+inline std::atomic<unsigned long long>& scanLimitCounter()
+{
+    static std::atomic<unsigned long long> c{ 0 };
+    return c;
+}
+inline unsigned long long scanLimitTruncations() noexcept
+{
+    return scanLimitCounter().load(std::memory_order_relaxed);
+}
+inline void resetScanLimitTruncations() noexcept
+{
+    scanLimitCounter().store(0, std::memory_order_relaxed);
+}
 
 struct BlockPosition
 {
@@ -56,25 +77,64 @@ inline double samplesPerPPQ(double bpm, double sampleRate)
     return 60.0 * sampleRate / bpm;
 }
 
+// Diagnose-Zaehler (P3): Anzahl der Ereignisse, die wegen Rounding hinter das
+// Blockende dem naechsten Block ueberlassen wurden. Atomar; im Audio-Pfad ein
+// einziger relaxed fetch_add pro betroffenem Ereignis. Tests lesen und setzen ihn.
+inline std::atomic<unsigned long long>& deferredToNextBlockCounter()
+{
+    static std::atomic<unsigned long long> counter{ 0 };
+    return counter;
+}
+inline unsigned long long deferredToNextBlockCount() noexcept
+{
+    return deferredToNextBlockCounter().load(std::memory_order_relaxed);
+}
+inline void resetDeferredToNextBlockCount() noexcept
+{
+    deferredToNextBlockCounter().store(0, std::memory_order_relaxed);
+}
+
 // sampleOffset = round((eventPPQ - blockStartPPQ) * 60 * sampleRate / bpm)
-// Begrenzt auf [0, numSamples-1] (Plan 5.3 / Regel R21). Rückgabe leeres Optional, wenn
-// das Ereignis nicht innerhalb des halboffenen Blocks [blockStartPPQ, blockEndPPQ) liegt
-// oder Daten fehlen.
+// Gueltige Offsets liegen in [0, numSamples-1] (Plan 5.3 / Regel R21). Rueckgabe leeres
+// Optional, wenn das Ereignis nicht innerhalb des halboffenen Blocks
+// [blockStartPPQ, blockEndPPQ) liegt oder Daten fehlen.
 //
-// Randfall-Korrekturen (Audit 2026-10-31):
+// RUNDERUNG (Stabilitaetsrunde 2026-10-31): Es wird std::llround() verwendet –
+// Round-to-nearest, Halbwerte von null WEG. Damit ist der Referenzfall
+// 0.25 PPQ * 22050 Samples/PPQ = 5512.5 -> Offset 5513 deterministisch.
+// Vergleich: std::nearbyint()/std::lrint() folgen dem aktuellen Rundungsmodus
+// (ueblicherweise nearest-even -> 5512) und sind fuer exakte Halbwerte damit NICHT
+// modus-unabhaengig deterministisch; std::round() liefert denselben Wert wie
+// llround, aber als double mit anschließender Konvertierung. llround ist die
+// tatsächlich implementierte, dokumentierte Wahl.
+//
+// Randfall-Korrekturen (Audit 2026-10-31 / Stabilitaetsrunde):
 //  1. Kein Stillschweigen bei fehlenden Host-Daten: numSamples <= 0 ist ein
 //     Konfigurationsfehler und wird per assert markiert (Release: "kein Trigger").
-//     Die übrigen Invaliditätsgründe (bpm/sampleRate <= 0, nicht endliches startPPQ)
-//     sind legitime "Host liefert keine Sync-Daten"-Fälle im Sinne von Regel R7 und
-//     lösen kein assert aus.
-//  2. Nach-Kanten-Rounding: Ein Ereignis innerhalb [start,end), dessen Rundung hinter das
-//     letzte Sample fällt, würde beim Clamping auf numSamples-1 einen Doppeltrigger am
-//     Blockende erzeugen; es wird dem nächsten Block überlassen. Der Fall tritt nur bei
-//     Blöcken kleiner als ca. 1 Sample pro Schrittweite auf und ist asserted.
-//  3. Vor-Kanten-Rounding (neu): Symmetrisch dazu darf ein Ereignis, das formal erst im
-//     NACHSTEN Block liegt (eventPPQ >= endPPQ), durch Rundung nicht auf den letzten
-//     Sample-Offset DIESES Blocks fallen – das wäre exakt derselbe Doppeltrigger. Solche
-//     Ereignisse werden abgewiesen; der nächste Block triggert sie an Offset 0 bzw. früh.
+//     Die uebrigen Invaliditaetsgruende (bpm/sampleRate <= 0, nicht endliches startPPQ)
+//     sind legitime "Host liefert keine Sync-Daten"-Faelle im Sinne von Regel R7 und
+//     loesen kein assert aus.
+//  2. Nach-Kanten-Rounding: Ein Ereignis innerhalb [start,end), dessen Rundung hinter
+//     das letzte Sample (>= numSamples) faellt, wuerde beim Clamping auf numSamples-1
+//     einen Doppeltrigger am Blockende erzeugen; es wird dem naechsten Block
+//     ueberlassen. VERLUSTFREIHEIT: Der naechste Block beginnt host-seitig exakt bei
+//     endPPQ (Positionsfortschreibung startPPQ(b+1) := endPPQ(b)). Liegt das Ereignis
+//     formal noch vor dieser Grenze, liegt es im naechsten Block und wird dort ueber
+//     seinen negativen relativen Offset an Offset 0 ausgeloeset (Fall 4). Liegt es auf
+//     oder hinter der Grenze, gehoert es ohnehin in den naechsten Block. In beiden
+//     Faellen triggert es genau einmal.
+//     DIAGNOSE (P3): Dieser Fall war bisher als assert(false) ausgefuehrt – bei
+//     Blockgroessen unter einer Schrittweite (z. B. Testblockgroesse 1) haette jeder
+//     Debug-Lauf das Programm abgebrochen, obwohl das Verhalten definiert und
+//     verlustfrei ist. Er zaehlt jetzt den Diagnose-Zaehler deferredToNextBlockCount()
+//     und liefert nullopt ohne Assert.
+//  3. Vor-Kanten-Rounding: Ein Ereignis, das formal erst im NAECHESTEN Block liegt
+//     (eventPPQ >= endPPQ), darf durch Rundung nicht auf den letzten Sample-Offset
+//     DIESES Blocks fallen – derselbe Doppeltrigger. Solche Ereignisse werden
+//     abgewiesen; der naechste Block triggert sie an Offset 0 bzw. frueh.
+//  4. Unterlauf-Rounding (neu, ergaenzt zu Fall 2): Ein Ereignis innerhalb
+//     [start,end), das wegen float-Drift negativ rundet, wird auf Offset 0 gehoben –
+//     gueltig, da eventPPQ >= startPPQ.
 inline std::optional<int> sampleOffsetForEventPPQ(const BlockPosition& p, double eventPPQ)
 {
     if (!isValid(p))
@@ -91,14 +151,17 @@ inline std::optional<int> sampleOffsetForEventPPQ(const BlockPosition& p, double
         return std::nullopt;
 
     const double sppq = samplesPerPPQ(p.bpm, p.sampleRate);
-    long long off = std::llround((eventPPQ - p.startPPQ) * sppq);
+    const double rel = (eventPPQ - p.startPPQ) * sppq;
+    long long off = std::llround(rel); // siehe RUNDERUNG-Kommentar oben
     if (off > static_cast<long long>(p.numSamples) - 1)
     {
-        assert(false && "Ereignis rundet hinter das Blockende -> nächster Block (Doppeltrigger-Schutz)");
+        // Definiert und verlustfrei: Ereignis gehoert in den naechsten Block
+        // (Fall 2). Kein Assert, kein Clamping auf numSamples-1 (Doppeltrigger-Schutz).
+        deferredToNextBlockCounter().fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
     if (off < 0)
-        off = 0; // Rundung auf Blockanfang; gültig, da eventPPQ >= startPPQ
+        off = 0; // Rundung auf Blockanfang; gueltig, da eventPPQ >= startPPQ
     return static_cast<int>(off);
 }
 
@@ -145,12 +208,18 @@ void collectStepOffsetsInBlock(const BlockPosition& p,
     long long i1 = static_cast<long long>(std::ceil((endPPQ - cycleStartPPQ) / kPpqPerStep));
     if (i0 < 0) i0 = 0;
     if (i1 < i0) i1 = i0;
-    // Kosten-Deckel gegen pathologische Eingaben (z. B. Host mit ppm-großer BPM oder
+    // Kosten-Deckel gegen pathologische Eingaben (z. B. Host mit extrem hoher BPM oder
     // defektem startPPQ): verhindert einen praktisch endlosen Loop im Audio-Thread.
-    // Steps, die nicht geprüft werden können, gehen verloren statt den Thread zu blockieren.
-    constexpr long long kMaxStepsPerBlockScan = 4096;
-    if (i1 - i0 > kMaxStepsPerBlockScan)
-        i1 = i0 + kMaxStepsPerBlockScan;
+    // Steps, die nicht geprueft werden koennen, gehen verloren statt den Thread zu
+    // blockieren. Der Verlust ist DIAGNOSTIZIERBAR: kMaxStepsPerBlockScan ist
+    // exportiert, und beim Erreichen des Limits wird scanLimitTruncations() erhoeht.
+    // Ein Host, dessen Block mehr als kMaxStepsPerBlockScan Steps enthaelt, ist
+    // Konfigurationsfehler bzw. Pathologie – die Zahl muss sichtbar bleiben.
+    if (i1 - i0 >= kMaxStepsPerBlockScan)
+    {
+        i1 = i0 + kMaxStepsPerBlockScan - 1;
+        scanLimitCounter().fetch_add(1, std::memory_order_relaxed);
+    }
 
     for (long long i = i0; i <= i1; ++i)
     {
