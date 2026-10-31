@@ -17,11 +17,18 @@
 // ---------------------------------------------------------------------------
 // ZUORDNUNGSVERTRAG (eindeutig, deterministisch, verlustfrei):
 //
-// 1. Jedes Ereignis wird auf die ABSOLUTE Sampleposition A(ev) = ev * samplesPerPPQ
-//    abgebildet, wobei samplesPerPPQ = 60*sampleRate/bpm ein Festwert fuer die
-//    Lebensdauer eines Pattern-Zyklus sein MUSS (Tempo aendert die Zuordnung; das ist
-//    durch den Host-Vertrag so vorgesehen, siehe Punkt 6). Die Abbildung ev -> A(ev)
-//    ist strikt monoton wachsend.
+// 1. Jedes Ereignis wird auf eine ABSOLUTE Sampleposition T(ev) abgebildet. Diese
+//    Position liegt auf EINER durchgaengigen Samplezeitachse: der Host zaehlt Samples
+//    kontinuierlich, und jedes Blockintervall [startPPQ(b), endPPQ(b)) besitzt mit dem
+//    in DIESEM Block geltenden samplesPerPPQ(b) = 60*sampleRate/bpm exakt numSamples(b)
+//    Samples. Fuer die absolute Samplekoordinate gilt daher die stueckweise Integration
+//        T(ev) = S_start(b) + (ev - startPPQ(b)) * sppq(b)   fuer ev in I_b,
+//    mit S_start(b+1) := S_start(b) + numSamples(b). Innerhalb eines Blocks mit
+//    konstantem sppq ist das identisch zu llround(ev*sppq) - llround(startPPQ*sppq);
+//    bei einer Tempoaenderung an einer Blockgrenze bleibt dieselbe Achse erhalten,
+//    weil der Zeitanker S_start(b) aus der HOST-Fortschreibung stammt und NICHT aus
+//    der neuen Sample-Dichte des Folgeblocks neu berechnet wird (siehe Punkt 6 und
+//    blockStartSample()). Die Abbildung ev -> T(ev) ist strikt monoton wachsend.
 //
 // 2. Jeder Audio-Block b besitzt das halboffene PPQ-Intervall
 //        I_b = [startPPQ(b), endPPQ(b)),   startPPQ(b+1) := endPPQ(b).
@@ -64,11 +71,25 @@
 //      scanLimitTruncations(): erreichte Kosten-Deckel kMaxStepsPerBlockScan.
 //      invalidInputCount(): kontrollierte Abbrüche wegen NaN/Inf/extremer Werte.
 //
-// 6. Tempo-/SampleRate-Aenderung: Sie verschiebt die Samplezuordnung aller
-//    Ereignisse. Der Vertrag gilt pro konstantem Festwert; bei Aenderung an einer
-//    Blockgrenze beginnt er ab diesem Block neu (Host setzt startPPQ fort). Fuer
-//    Swing gilt analog: Swing aendert die PPQ-Positionen des Rasters und damit die
+// 6. Tempo-/SampleRate-Aenderung: Die stueckweise Integration (Punkt 1) bleibt bei
+//    einer Aenderung AN EINER BLOCKGRENZE verlustfrei, SOFERN der Aufrufer den
+//    durchgaengigen Sample-Zeitanker uebergibt (BlockPosition::startSampleAbs =
+//    S_start(b), vom Host fortschreitend: startSampleAbs(b+1) = startSampleAbs(b) +
+//    numSamples(b)). Dann gilt fuer jedes Ereignis dieselbe Achse, und jeder Step
+//    erreicht genau einen Block. Wird KEIN Zeitanker gesetzt (Default -1 = "nicht
+//    verfuegbar"), faellt die Abbildung auf die blocklokale Rechnung
+//    llround(ev*sppq) - llround(startPPQ*sppq) zurueck; diese NEUSTART-Koordinate ist
+//    bei Tempowechseln nicht mit der Vorgängerachse konsistent und kann einen direkt
+//    vor der Grenze liegenden Step um bis zu 1 Sample versetzen bzw. an der Kante
+//    verlieren – dokumentierte Einschraenkung, kein behaupteter Nachweis. Fuer Swing
+//    gilt analog: Swing aendert die PPQ-Positionen des Rasters und damit die
 //    Zuordnung; innerhalb eines Zyklus muss der Wert konstant bleiben.
+//
+// SEEK: Timing.h verwaltet keinen Host-Transportzustand. Ein Positionssprung wird
+//    dadurch modelliert, dass der Host naechste Blocks mit neuer startPPQ UND
+//    passendem startSampleAbs liefert; eine eigene "Seek"-Funktion existiert nicht.
+//    Ohne konsistenten neuen Zeitanker ist die Phase nach Seek nicht garantiert
+//    lueckenlos (siehe Punkt 6 oben); das ist im Test explizit getrennt geprueft.
 //
 // RUNDERUNGSVERTRAG: std::llround() – Round-to-nearest, Halbwerte von null WEG.
 // Referenzfall: 0.25 PPQ * 22050 Samples/PPQ = 5512.5 -> 5513.
@@ -238,6 +259,12 @@ struct BlockPosition
     double bpm = 0.0;      // Host-Tempo; <= 0 bedeutet "nicht verfügbar"
     int numSamples = 0;
     double sampleRate = 0.0;
+    // Durchgaengiger Sample-Zeitanker S_start(b) des Hosts (Vertrag Punkt 1/6).
+    // Der Host fortschreibt ihn: startSampleAbs(b+1) = startSampleAbs(b) + numSamples(b).
+    // Default -1 bedeutet "nicht verfuegbar"; dann nutzt die Zuordnung die blocklokale
+    // Naeherung llround(ev*sppq)-llround(startPPQ*sppq) (bei Tempowechseln mit
+    // dokumentierter Achsen-Einschraenkung).
+    long long startSampleAbs = -1;
 };
 
 // Host-Sync-Daten vorhanden und im sicheren Zahlenbereich? bpm/sampleRate <= 0
@@ -305,10 +332,48 @@ inline bool safeLlround(double v, long long& out) noexcept
     return true;
 }
 
-// Zuordnungsregel (Vertrag Punkt 2): gehoert der absolute, gerundete Sampleindex
-// s = llround(eventPPQ * sppq) zum Sample-Bereich [S_start, S_start+numSamples)
-// des Blocks? Wenn ja, wird der relative Offset geliefert.
+// Zuordnungsregel (Vertrag Punkt 1/2): gehoert der absolute, gerundete Sampleindex
+// s = T(eventPPQ) zum Sample-Bereich [S_start, S_start+numSamples) des Blocks?
+// Wenn ja, wird der relative Offset geliefert.
 //
+// Zuordnungsregel (Vertrag Punkt 1/2): bestimme den gerundeten Block-Anfang S_start.
+// Mit Host-Zeitanker (startSampleAbs >= 0) ist das exakt der durchgaengige Wert; ohne
+// Anker wird er aus startPPQ*sppq abgeleitet (blocklokale Achse, Einschraenkung siehe
+// Vertrag Punkt 6). Rueckgabe false bei Werten jenseits des sicheren Bereichs (P3).
+inline bool blockStartSample(const BlockPosition& p, double sppq, long long& out) noexcept
+{
+    if (p.startSampleAbs >= 0)
+    {
+        out = p.startSampleAbs;
+        return true;
+    }
+    return safeLlround(p.startPPQ * sppq, out);
+}
+
+// Absolute Samplekoordinate T(ev) eines Ereignisses im Kontext DIESES Blocks
+// (stueckweise Integration, Vertrag Punkt 1):
+//   T(ev) = S_start + (ev - startPPQ) * sppq   fuer ev in [startPPQ, endPPQ).
+// Ausserhalb des PPQ-Intervalls wird dieselbe Formel fortgeschrieben (Carry-In /
+// Nachkanten-Rundung, Vertrag Punkt 2/5); die Zuordnung entscheidet per Sampleindex.
+// Rueckgabe false, wenn ein Wert den sicheren Konvertierungsbereich verlaesst (P3).
+inline bool absSampleForEvent(const BlockPosition& p, double sppq, double eventPPQ,
+                              long long& out) noexcept
+{
+    long long sStart = 0;
+    if (!blockStartSample(p, sppq, sStart))
+        return false;
+    const double rel = (eventPPQ - p.startPPQ) * sppq; // Differenz zweier sicherer Werte
+    if (!std::isfinite(rel) || std::fabs(rel) >= kMaxSafeMagnitude)
+        return false;
+    // Addition: |sStart| < 2^52 und |rel| < 2^52 -> Summe bleibt weit innerhalb von
+    // long long; das Ergebnis wird vor der Konvertierung erneut geprueft.
+    const double t = static_cast<double>(sStart) + rel;
+    if (!std::isfinite(t) || std::fabs(t) >= kMaxSafeMagnitude)
+        return false;
+    out = std::llround(t);
+    return true;
+}
+
 // sampleOffsetForEventPPQ() liefert das Sample-Offset [0, numSamples-1] genau dann,
 // wenn das Ereignis gemaess Vertrag zu DIESEM Block gehoert; sonst leeres Optional.
 // Rueckgabe ist ebenfalls leer, wenn keine Host-Daten vorliegen oder ein Wert
@@ -330,16 +395,16 @@ inline std::optional<int> sampleOffsetForEventPPQ(const BlockPosition& p, double
         return std::nullopt;
     }
 
-    // Absolute Sampleposition des Ereignisses und Blockanfang in Samples.
+    // Absolute Sampleposition des Ereignisses auf der Block-Zeitachse und Blockanfang.
     long long sAbs = 0, sStart = 0;
-    if (!safeLlround(eventPPQ * sppq, sAbs) || !safeLlround(p.startPPQ * sppq, sStart))
+    if (!absSampleForEvent(p, sppq, eventPPQ, sAbs) || !blockStartSample(p, sppq, sStart))
     {
         invalidInputCounter().fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
 
     const long long ns = static_cast<long long>(p.numSamples);
-    const long long rel = sAbs - sStart; // Differenz zweier |.|<2^52-Werte: overflowfrei
+    const long long rel = sAbs - sStart; // beide |.|<2^52: Differenz overflowfrei
 
     if (rel >= 0 && rel < ns)
     {
@@ -411,28 +476,30 @@ void collectStepOffsetsInBlock(const BlockPosition& p,
     // Zu untersuchender Schrittindex-Bereich: jeder Step i hat die Position
     //   ppq(i) = cycleStart + i*0.25 (+ Swing, 0..0.125 PPQ, nur ungerade i).
     // Er kann nur dann in den Block fallen, wenn seine absolute Sampleposition im
-    // Sample-Bereich [sStart, sStart+ns) liegt. Da ppq monotom in i ist, ergibt sich
-    // der Kandidatenbereich durch Aufloesen nach i (mit Sicherheitsrand fuer Swing und
-    // Rundung). Steps auflerhalb des Rasters werden von der Zuordnungsregel verworfen.
+    // Sample-Bereich [sStart, sStart+ns) liegt. Da ppq(i) monoton in i ist und ein
+    // Kandidat mit zugeordnetem Offset ev < startPPQ + ns/sppq + 1/sppq erfuellen muss
+    // (Nachkanten-Rundung), reicht der Kandidatenbereich bis
+    //   endPPQ + numSamples/sppq + 1/sppq. Der Term numSamples/sppq ist kein Tippfehler,
+    // sondern deckt genau die Faelle ab, in denen ein Ereignis PPQ-seitig hinter dem
+    // Blockende liegt, aber per Sampleindex noch (oder erst) hierhaelt; Steps ausserhalb
+    // des Rasters werden von der Zuordnungsregel selbst verworfen.
     long long sStart = 0;
-    if (!safeLlround(p.startPPQ * sppq, sStart))
+    if (!blockStartSample(p, sppq, sStart))
     {
         invalidInputCounter().fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const double maxSwing = swingOffsetPPQ(swingPercent);
     const double stepSecPPQ = kPpqPerStep; // 0.25
-    // ppq_min(i) = cycleStart + i*0.25 ; ppq_max(i) = ppq_min(i) + maxSwing
-    // Bedingung ppq(i) >= startPPQ - delta  ->  i >= (startPPQ - delta - cycleStart - maxSwing)/0.25
-    // Bedingung ppq(i) <  endPPQ  + delta'  ->  i <  (endPPQ + delta' - cycleStart)/0.25
-    // delta/delta' beruecksichtigen die +-1 Sample Rundungsunsicherheit (1/sppq PPQ).
+    const double scanEndPPQ = computeBlockEndPPQ(p)
+                            + static_cast<double>(p.numSamples) / sppq + 1.0 / sppq;
     long long i0 = 0, i1 = 0;
     if (!toLLSafe(std::floor((p.startPPQ - cycleStartPPQ - maxSwing - 1.0 / sppq) / stepSecPPQ), i0))
     {
         invalidInputCounter().fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    if (!toLLSafe(std::ceil((computeBlockEndPPQ(p) - cycleStartPPQ + 1.0 / sppq) / stepSecPPQ), i1))
+    if (!toLLSafe(std::ceil((scanEndPPQ - cycleStartPPQ) / stepSecPPQ), i1))
     {
         invalidInputCounter().fetch_add(1, std::memory_order_relaxed);
         return;
